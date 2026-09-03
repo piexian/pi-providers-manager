@@ -1,8 +1,15 @@
 {
   "name": "pi-providers-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Interactive TUI manager for pi providers, models, and subagents (/providers + /agents commands)",
-  "keywords": ["pi-package", "pi-extension", "providers", "models", "agents", "tui"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "providers",
+    "models",
+    "agents",
+    "tui"
+  ],
   "type": "module",
   "license": "MIT",
   "author": "Earendil",
@@ -11,11 +18,20 @@
     "url": "https://github.com/piexian/pi-providers-manager.git"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "dependencies": {
+    "comment-json": "^4.2.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^24.0.0"
   }
 }
