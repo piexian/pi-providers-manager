@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse } from "comment-json";
-import { TransportConfigStore, validateTransportSettings, type ProviderTransportSettings } from "./transport-config.ts";
+import { TransportConfigStore, validateTransportSettings, isResponsesApi, type ProviderTransportSettings } from "./transport-config.ts";
 import { ResponsesWebSocketTransport } from "./responses-websocket.ts";
 import { withIdleTimeout } from "./idle-timeout-fetch.ts";
 
@@ -25,25 +25,30 @@ function timeoutDefaults(agentDir: string, ctx: ExtensionContext, configDirName:
 	return defaults;
 }
 
-/** The legacy extension hook receives both simple and API-specific option objects. */
+/** Legacy Responses-only adapter; other APIs keep their native stream entrypoints. */
 export function delegateStream(base: Provider, model: Parameters<Provider["streamSimple"]>[0], context: Parameters<Provider["streamSimple"]>[1], options: StreamOptions) {
+	if (!isResponsesApi(model.api)) throw new Error("非 Responses API 必须保留原生传输入口");
 	const rawOptions = options as StreamOptions & Record<string, unknown>;
-	const fullApiCall = ["reasoningEffort", "reasoningSummary", "textVerbosity", "serviceTier"].some((key) => Object.hasOwn(rawOptions, key));
-	return fullApiCall ? base.stream(model, context, options) : base.streamSimple(model, context, options);
+	const fullKeys = model.api === "openai-responses" ? ["reasoningEffort", "reasoningSummary", "serviceTier"] : ["reasoningEffort", "reasoningSummary", "textVerbosity", "serviceTier"];
+	return fullKeys.some((key) => Object.hasOwn(rawOptions, key)) ? base.stream(model, context, options) : base.streamSimple(model, context, options);
 }
 
 export function applyTransportOptions(modelApi: string, settings: ProviderTransportSettings, defaults: ProviderTransportSettings, options: StreamOptions, bridge: ResponsesWebSocketTransport, onFallback: (reason: string) => void): StreamOptions {
 	const transport = settings.transport;
 	const strict = transport === "websocket" || transport === "websocket-cached";
-	const supported = modelApi === "openai-responses" || modelApi === "openai-codex-responses";
-	if (strict && !supported) throw new Error(`${modelApi} 没有 WS 适配；请恢复继承或 SSE`);
+	if (!isResponsesApi(modelApi)) throw new Error(`${modelApi} 没有安全的 WS/传输适配；必须保留原生入口`);
 	const idleMs = settings.httpIdleTimeoutMs ?? defaults.httpIdleTimeoutMs ?? 300_000;
 	const connectMs = settings.websocketConnectTimeoutMs ?? options.websocketConnectTimeoutMs ?? defaults.websocketConnectTimeoutMs ?? 15_000;
 	const next: StreamOptions = { ...options, websocketConnectTimeoutMs: connectMs };
 	if (transport !== undefined) next.transport = transport;
-	if (modelApi === "openai-codex-responses") next.timeoutMs = settings.httpIdleTimeoutMs ?? options.timeoutMs ?? idleMs;
+	if (settings.httpIdleTimeoutMs !== undefined) {
+		// SDK zero means immediate timeout, unlike our disabled idle timer; caller signals stay intact.
+		next.timeoutMs = modelApi === "openai-codex-responses" || idleMs !== 0 ? idleMs : 2_147_483_647;
+	} else if (modelApi === "openai-codex-responses") next.timeoutMs = options.timeoutMs ?? idleMs;
 	const fallbackFetch = withIdleTimeout(options.fetch ?? globalThis.fetch, idleMs);
 	if (modelApi === "openai-responses" && transport && transport !== "sse") {
+		// The bridge owns handshake, fallback HTTP and stream-idle timers; an SDK timer would race them.
+		next.timeoutMs = 2_147_483_647;
 		next.fetch = bridge.createFetch({
 			transport,
 			sessionId: options.cacheRetention === "none" ? undefined : options.sessionId,
@@ -101,6 +106,10 @@ export function registerProviderTransports(pi: ExtensionAPI, store: TransportCon
 				continue;
 			}
 			const api = apis[0];
+			if (!isResponsesApi(api)) {
+				ctx.ui.notify(`${id}: ${api} 保留原生传输与思考参数，本插件不应用传输/超时覆盖`, "warning");
+				continue;
+			}
 			if (configError) ctx.ui.notify(`${id}: 传输设置无效，已阻止该供应商请求；请修正配置后 /reload`, "error");
 			const wrapper: Provider["streamSimple"] = (model, context, options = {}) => {
 				if (configError) throw new Error(`${id}: 传输设置无效，禁止回退原始传输；请修正 ${store.path} 后 /reload`);

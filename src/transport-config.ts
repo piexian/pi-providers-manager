@@ -3,6 +3,10 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse, stringify } from "comment-json";
 
+export function isResponsesApi(api: string): boolean {
+	return api === "openai-responses" || api === "openai-codex-responses";
+}
+
 export const TRANSPORTS = ["auto", "sse", "websocket", "websocket-cached"] as const;
 export type Transport = (typeof TRANSPORTS)[number];
 export interface ProviderTransportSettings {

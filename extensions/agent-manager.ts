@@ -10,7 +10,7 @@
  *
  * 列出 ~/.pi/agent/agents/*.md，交互编辑 model / thinkingLevel / tools /
  * description / 系统提示正文，支持新建和删除。
- * frontmatter 按行处理：只改受管字段，其余行原样保留。
+ * frontmatter 按完整 YAML 字段范围修改，其余内容原样保留。
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getAgentDir, CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -21,12 +21,13 @@ import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { TransportConfigStore } from "../src/transport-config.ts";
 import { editProviderTransport } from "../src/transport-ui.ts";
 import { registerProviderTransports } from "../src/provider-transport-runtime.ts";
+import { parseAgentFields, setAgentField } from "../src/agent-frontmatter.ts";
+import { fetchEndpointModels, modelsListUrl, positiveInteger, resolveSecret } from "../src/provider-models.ts";
+import { loadModelsDev, lookupModelsDev, modelsDevCandidates, type ModelsDevEntry, type ModelsDevIndex } from "../src/models-dev.ts";
 
 const AGENT_DIR = getAgentDir();
 const AGENTS_DIR = join(AGENT_DIR, "agents");
 const transportStore = new TransportConfigStore(join(AGENT_DIR, "provider-transports.json"));
-/** 受管 frontmatter 字段（单行 key: value） */
-const MANAGED_KEYS = ["name", "description", "tools", "model", "thinkingLevel"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
@@ -40,28 +41,17 @@ interface AgentFile {
 	tools: string;
 }
 
-/** 解析 frontmatter 中的受管字段（只认单行 key: value） */
+/** 解析受管 YAML 字段，包括多行描述。 */
 export function parseFields(lines: string[]): Record<string, string> {
-	const fields: Record<string, string> = {};
-	for (const line of lines) {
-		const kv = line.match(/^([A-Za-z]+):\s*(.*)$/);
-		if (kv && (MANAGED_KEYS as readonly string[]).includes(kv[1])) {
-			let v = kv[2].trim();
-			// 去掉双引号（我们序列化时用 JSON 引号）
-			if (v.startsWith('"') && v.endsWith('"')) {
-				try { v = JSON.parse(v); } catch { /* 原样保留 */ }
-			}
-			fields[kv[1]] = v;
-		}
-	}
-	return fields;
+	return parseAgentFields(lines.join("\n"));
 }
 
 export function readAgent(path: string): AgentFile | null {
 	const content = readFileSync(path, "utf8");
-	const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	const m = content.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
 	if (!m) return null;
-	const fields = parseFields(m[1].split(/\r?\n/));
+	let fields: Record<string, string>;
+	try { fields = parseFields(m[1].split(/\r?\n/)); } catch { return null; }
 	return {
 		path,
 		name: fields.name ?? "",
@@ -81,41 +71,22 @@ export function listAgents(): AgentFile[] {
 		.filter((a): a is AgentFile => a !== null);
 }
 
-/** 更新或清除某个受管字段；值不存在则追加，清空则删行 */
+/** 校验并原子更新完整字段，保留其余内容。 */
 export function setField(path: string, key: string, value: string | undefined): void {
-	const content = readFileSync(path, "utf8");
-	const m = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)([\s\S]*)$/);
-	if (!m) throw new Error("frontmatter 格式无法识别");
-	const lines = m[2].split(/\r?\n/);
-	const serialized = value === undefined || value === "" ? undefined
-		: key === "description" ? JSON.stringify(value)
-		: value;
-	let found = false;
-	const out: string[] = [];
-	for (const line of lines) {
-		const kv = line.match(/^([A-Za-z]+):/);
-		if (kv && kv[1] === key) {
-			found = true;
-			if (serialized !== undefined) out.push(`${key}: ${serialized}`);
-			continue; // 清掉旧行（含被清除的情况）
-		}
-		out.push(line);
-	}
-	if (!found && serialized !== undefined) out.push(`${key}: ${serialized}`);
-	writeFileSync(path, m[1] + out.join("\n") + m[3] + m[4]);
+	setAgentField(path, key, value);
 }
 
 export function getBody(path: string): string {
 	const content = readFileSync(path, "utf8");
-	const m = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/);
+	const m = content.match(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/);
 	return m ? m[1] : content;
 }
 
 export function setBody(path: string, body: string): void {
 	const content = readFileSync(path, "utf8");
-	const m = content.match(/^(---\r?\n[\s\S]*?\r?\n---)\r?\n?[\s\S]*$/);
+	const m = content.match(/^(\uFEFF?---\r?\n[\s\S]*?\r?\n---)\r?\n?[\s\S]*$/);
 	if (!m) throw new Error("frontmatter 格式无法识别");
-	writeFileSync(path, m[1] + "\n" + body);
+	writeFileSync(path, m[1] + (content.includes("\r\n") ? "\r\n" : "\n") + body);
 }
 
 /** 通用单选对话框（支持输入字符过滤，子串匹配 label/value/description） */
@@ -302,13 +273,6 @@ function saveModelsJson(cfg: ModelsJson): void {
 	writeFileSync(MODELS_JSON_PATH, stringifyJsonc(cfg, null, 2) + "\n");
 }
  
-/** 解析 apiKey 配置值：$ENV / 字面量；!command 不支持返回 undefined */
-function resolveSecret(v: string | undefined): string | undefined {
-	if (!v) return undefined;
-	if (v.startsWith("$")) return process.env[v.slice(1).replace(/[{}]/g, "")];
-	if (v.startsWith("!")) return undefined;
-	return v;
-}
  
 /** 拉取模型列表的鉴权头：按 API 类型选择网关习惯的凭证头 */
 function buildModelsListHeaders(api: string | undefined, apiKey?: string): Record<string, string> {
@@ -326,61 +290,6 @@ function stripVersionSuffix(api: string | undefined, baseUrl: string): { url: st
 	return { url: baseUrl.replace(VERSION_SUFFIX_RE, ""), stripped };
 }
  
-/** 从 {baseUrl}/models 拉取模型 id 列表 */
-async function fetchEndpointModels(baseUrl: string, headers: Record<string, string> = {}): Promise<string[]> {
-	const url = baseUrl.replace(/\/+$/, "") + "/models";
-	const res = await fetch(url, {
-		headers,
-		signal: AbortSignal.timeout(10_000),
-	});
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	const data = (await res.json()) as { data?: Array<{ id?: string }> };
-	return (data.data ?? []).map((m) => m.id).filter((x): x is string => !!x).sort();
-}
- 
-// ---------- models.dev 元数据 ----------
- 
-interface ModelsDevEntry {
-	name?: string;
-	reasoning?: boolean;
-	reasoning_options?: Array<{ type?: string; values?: string[] }>;
-	modalities?: { input?: string[] };
-	cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
-	limit?: { context?: number; output?: number };
-}
- 
-let modelsDevCache: Map<string, ModelsDevEntry> | null = null;
- 
-/** 拉取 models.dev 全量索引（内存缓存）；key 为小写 id 及去前缀形式 */
-async function loadModelsDev(): Promise<Map<string, ModelsDevEntry>> {
-	if (modelsDevCache) return modelsDevCache;
-	const map = new Map<string, ModelsDevEntry>();
-	try {
-		const res = await fetch("https://models.dev/api.json", { signal: AbortSignal.timeout(15_000) });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = (await res.json()) as Record<string, { models?: Record<string, ModelsDevEntry> }>;
-		for (const provider of Object.values(data)) {
-			for (const [id, entry] of Object.entries(provider.models ?? {})) {
-				const key = id.toLowerCase();
-				if (!map.has(key)) map.set(key, entry);
-				const short = key.split("/").pop() ?? key;
-				if (!map.has(short)) map.set(short, entry);
-			}
-
-		}
-	} catch {
-		// 失败不缓存，下次操作重试；本次按无元数据处理
-		return map;
-	}
-
-	modelsDevCache = map;
-	return map;
-}
- 
-function lookupModelsDev(index: Map<string, ModelsDevEntry>, id: string): ModelsDevEntry | undefined {
-	const key = id.toLowerCase();
-	return index.get(key) ?? index.get(key.split("/").pop() ?? key);
-}
  
 /** 按 models.dev 元数据构建模型条目 */
 function buildModelEntry(id: string, meta: ModelsDevEntry | undefined): ModelEntry {
@@ -417,7 +326,7 @@ async function addModelWithMeta(
 	ctx: ExtensionCommandContext,
 	providerId: string,
 	modelId: string,
-	index: Map<string, ModelsDevEntry>,
+	index: ModelsDevIndex,
 ): Promise<void> {
 	const cfg = loadModelsJson();
 	const p = cfg.providers[providerId];
@@ -427,9 +336,23 @@ async function addModelWithMeta(
 		return;
 	}
 
-	const meta = lookupModelsDev(index, modelId);
-	p.models.push(buildModelEntry(modelId, meta));
-	saveModelsJson(cfg);
+	let meta = lookupModelsDev(index, modelId, providerId);
+	const candidates = modelsDevCandidates(index, modelId, providerId);
+	if (candidates.length > 1) {
+		const selected = await pick(ctx, `${modelId} 存在多个元数据来源，请选择`, [
+			...candidates.map((candidate, i) => ({ value: String(i), label: `${candidate.provider} / ${candidate.id}`, description: `context: ${candidate.meta.limit?.context ?? "?"}; maxTokens: ${candidate.meta.limit?.output ?? "?"}` })),
+			{ value: "skip", label: "跳过元数据（仅添加 id）" },
+		]);
+		if (selected === null) return;
+		meta = selected === "skip" ? undefined : candidates[Number(selected)]?.meta;
+	}
+	const fresh = loadModelsJson();
+	const target = fresh.providers[providerId];
+	if (!target) throw new Error("供应商已被移除，未添加模型");
+	target.models ??= [];
+	if (target.models.some((model) => model.id === modelId)) { ctx.ui.notify("该模型已存在", "warning"); return; }
+	target.models.push(buildModelEntry(modelId, meta));
+	saveModelsJson(fresh);
 	ctx.ui.notify(
 		meta ? `已添加 ${modelId}（已按 models.dev 填充参数）` : `已添加 ${modelId}（models.dev 无数据，仅写入 id）`,
 		"info",
@@ -457,7 +380,9 @@ async function addModelsFromEndpoint(ctx: ExtensionCommandContext, providerId: s
 	let ids: string[];
 	try {
 		ctx.ui.notify("正在拉取模型列表…", "info");
-		ids = await fetchEndpointModels(p.baseUrl, buildModelsListHeaders(p.api, resolveSecret(p.apiKey)));
+		const key = resolveSecret(p.apiKey);
+		if (p.apiKey && key === undefined) throw new Error("apiKey 包含未设置的环境变量，未发送请求");
+		ids = await fetchEndpointModels(p.baseUrl, buildModelsListHeaders(p.api, key), p.api);
 	} catch (e) {
 		ctx.ui.notify(`拉取失败: ${e instanceof Error ? e.message : e}，请改用手动输入`, "error");
 		return;
@@ -475,7 +400,7 @@ async function addModelsFromEndpoint(ctx: ExtensionCommandContext, providerId: s
 		const items: SelectItem[] = ids.map((id) => ({
 			value: id,
 			label: existing.has(id) ? `${id} ✓` : id,
-			description: existing.has(id) ? "已存在" : (lookupModelsDev(index, id)?.name ?? undefined),
+			description: existing.has(id) ? "已存在" : (lookupModelsDev(index, id, providerId)?.name ?? "元数据需确认或未提供"),
 		}));
 		const chosen = await pick(ctx, `添加模型到 ${providerId} (esc 结束)`, items);
 		if (chosen === null) return;
@@ -657,13 +582,8 @@ async function editModelEntry(ctx: ExtensionCommandContext, providerId: string):
 				const cur = action === "contextWindow" ? m.contextWindow : m.maxTokens;
 				const v = await ctx.ui.input(`${action} (数字，留空清除):`, cur === undefined ? "" : String(cur));
 				if (v !== undefined) {
-					const n = Number(v.trim());
-					if (v.trim() && (!Number.isFinite(n) || n <= 0)) {
-						ctx.ui.notify("必须是正整数", "error");
-						continue;
-					}
-
-					saveEntry((e) => { v.trim() ? (e[action] = Math.round(n)) : delete e[action]; });
+					const n = positiveInteger(v);
+					saveEntry((e) => { n === undefined ? delete e[action] : (e[action] = n); });
 					ctx.ui.notify("已保存", "info");
 				}
 
@@ -1102,13 +1022,8 @@ async function editOverride(
 				const cur = ov[action];
 				const v = await ctx.ui.input(`${action} (数字，留空清除):`, cur === undefined ? "" : String(cur));
 				if (v !== undefined) {
-					const n = Number(v.trim());
-					if (v.trim() && (!Number.isFinite(n) || n <= 0)) {
-						ctx.ui.notify("必须是正整数", "error");
-						continue;
-					}
-
-					persist((o) => { v.trim() ? (o[action] = Math.round(n)) : delete o[action]; });
+					const n = positiveInteger(v);
+					persist((o) => { n === undefined ? delete o[action] : (o[action] = n); });
 					ctx.ui.notify("已保存", "info");
 				}
 
@@ -1196,15 +1111,16 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 		const headerCount = Object.keys(headersOf(p)).length;
 		const overrideCount = Object.keys(providerModelOverrides(p)).length;
 		const apiKeyLabel = !p.apiKey ? "(未配置)"
-			: p.apiKey.startsWith("$") ? p.apiKey
 			: p.apiKey.startsWith("!") ? "!command"
 			: "已配置(不回显)";
 
+		let listEndpoint = "配置有效的 baseUrl 后可拉取";
+		try { if (p.baseUrl) listEndpoint = modelsListUrl(p.baseUrl, p.api).href; } catch { /* Invalid URLs remain editable. */ }
 		const action = await pick(ctx, `供应商 ${providerId}`, [
 			{
 				value: "add",
 				label: `添加模型 (接口拉取, 当前 ${p.models?.length ?? 0} 个)`,
-				description: `${(p.baseUrl ?? "").replace(/\/+$/, "")}/models`,
+				description: listEndpoint,
 			},
 			{ value: "add-manual", label: "添加模型 (手动输入)", description: "接口不可用时使用" },
 			{ value: "edit", label: "编辑模型", description: "模型级 api / compat / headers / 参数覆盖" },

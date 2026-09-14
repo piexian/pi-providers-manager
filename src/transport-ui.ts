@@ -1,4 +1,4 @@
-import { TRANSPORTS, TransportConfigStore, type Transport } from "./transport-config.ts";
+import { TRANSPORTS, TransportConfigStore, isResponsesApi, type Transport } from "./transport-config.ts";
 
 type Item = { value: string; label: string; description?: string };
 export interface TransportUI {
@@ -14,13 +14,14 @@ const DESCRIPTIONS: Record<Transport, string> = {
 };
 
 export async function editProviderTransport(ui: TransportUI, store: TransportConfigStore, providerId: string, apis: string[]): Promise<void> {
-	const unsupported = [...new Set(apis.filter((api) => api !== "openai-responses" && api !== "openai-codex-responses"))];
+	const unsupported = [...new Set(apis.filter((api) => !isResponsesApi(api)))];
+	if (unsupported.length) ui.notify(`保留这些 API 的原生传输与思考参数；本插件不应用传输/超时覆盖: ${unsupported.join(", ")}`, "warning");
 	for (;;) {
 		const settings = store.readProvider(providerId);
 		const action = await ui.pick(`${providerId} 传输设置（保存后 /reload 生效）`, [
-			{ value: "transport", label: `transport: ${settings.transport ?? "(继承 Pi，不接管传输)"}`, description: unsupported.length ? `这些 API 没有 WS 适配，严格 WS 会报错: ${unsupported.join(", ")}` : "适用于该供应商的全部模型；不改变 API 类型和凭据" },
+			{ value: "transport", label: `transport: ${settings.transport ?? "(继承 Pi，不接管传输)"}`, description: unsupported.length ? `保留原生传输，仅可清空旧覆盖: ${unsupported.join(", ")}` : "适用于该供应商的全部模型；不改变 API 类型和凭据" },
 			{ value: "websocketConnectTimeoutMs", label: `WS 握手超时: ${settings.websocketConnectTimeoutMs ?? "(继承 Pi，默认 15000)"} ms`, description: "0 禁用；留空清除供应商覆盖" },
-			{ value: "httpIdleTimeoutMs", label: `流空闲超时: ${settings.httpIdleTimeoutMs ?? "(继承 Pi，默认 300000)"} ms`, description: "WS/HTTP 等待流事件的最大空闲间隔；0 禁用" },
+			{ value: "httpIdleTimeoutMs", label: `请求/流空闲超时: ${settings.httpIdleTimeoutMs ?? "(继承 Pi，默认 300000)"} ms`, description: "同时覆盖 SDK 请求超时与流空闲间隔；0 禁用，调用方 AbortSignal 仍有效" },
 		]);
 		if (action === null) return;
 		if (action === "transport") {
@@ -30,8 +31,8 @@ export async function editProviderTransport(ui: TransportUI, store: TransportCon
 			]);
 			if (mode === null) continue;
 			if (mode !== "" && !(TRANSPORTS as readonly string[]).includes(mode)) continue;
-			if (mode && (new Set(apis).size !== 1 || ((mode === "websocket" || mode === "websocket-cached") && unsupported.length))) {
-				ui.notify("当前 API 组合无法应用此传输方式；混合 API 请拆分供应商，不支持 WS 的 API 请用 SSE", "error");
+			if (mode && (new Set(apis).size !== 1 || unsupported.length)) {
+				ui.notify("仅单一 Responses API 可应用传输覆盖；其他 API 保留原生入口", "error");
 				continue;
 			}
 			store.updateProvider(providerId, (p) => { if (mode) p.transport = mode as Transport; else delete p.transport; });
@@ -40,6 +41,10 @@ export async function editProviderTransport(ui: TransportUI, store: TransportCon
 			const value = await ui.input(`${action}（整数毫秒；0 禁用；留空继承 Pi）:`, current === undefined ? "" : String(current));
 			if (value === undefined) continue;
 			const trimmed = value.trim();
+			if (trimmed && (unsupported.length || new Set(apis).size !== 1)) {
+				ui.notify("此 API 保留原生超时；可清空旧覆盖", "error");
+				continue;
+			}
 			if (trimmed && (!/^\d+$/.test(trimmed) || Number(trimmed) > 2_147_483_647)) {
 				ui.notify("必须是 0 到 2147483647 的整数毫秒值", "error");
 				continue;

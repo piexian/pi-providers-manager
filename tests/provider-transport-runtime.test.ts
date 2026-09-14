@@ -171,7 +171,7 @@ test("strict Codex blocks its native HTTP fallback; unsupported strict API canno
 		const options = applyTransportOptions("openai-codex-responses", { transport: "websocket", httpIdleTimeoutMs: 0 }, {}, {}, bridge, () => {});
 		assert.equal(options.timeoutMs, 0);
 		await assert.rejects(options.fetch!("https://offline.invalid"), /禁止 Codex 回退/);
-		assert.throws(() => applyTransportOptions("anthropic-messages", { transport: "websocket" }, {}, {}, bridge, () => {}), /没有 WS 适配/);
+		assert.throws(() => applyTransportOptions("anthropic-messages", { transport: "websocket" }, {}, {}, bridge, () => {}), /必须保留原生入口/);
 	} finally { bridge.close(); }
 });
 
@@ -185,6 +185,75 @@ const piRoot = process.env.PI_TEST_PACKAGE_DIR ?? dirname(dirname(fileURLToPath(
 const aiRoot = join(piRoot, "node_modules/@earendil-works/pi-ai/dist");
 const responses = await import(pathToFileURL(join(aiRoot, "api/openai-responses.js")).href);
 const overflow = await import(pathToFileURL(join(aiRoot, "utils/overflow.js")).href);
+const anthropic = await import(pathToFileURL(join(aiRoot, "api/anthropic-messages.js")).href);
+
+test("non-Responses providers remain untouched; native Anthropic full thinking options survive", async (t) => {
+	const f = fixture(t);
+	const nativeModel = { ...model, provider: "native-anthropic", api: "anthropic-messages" };
+	const native = { ...f.bases.get("other")!, id: "native-anthropic", getModels: () => [nativeModel], stream: anthropic.stream, streamSimple: anthropic.streamSimple } as unknown as Provider;
+	f.bases.set("native-anthropic", native);
+	f.store.updateProvider("native-anthropic", (p) => { p.transport = "sse"; p.httpIdleTimeoutMs = 0; });
+	f.start();
+	assert.equal(f.registered.has("native-anthropic"), false);
+	assert.equal(f.ctx.modelRegistry.getProvider("native-anthropic"), native);
+	assert.ok(f.notices.some((text) => text.includes("保留原生传输")));
+	let payload: Record<string, unknown> | undefined;
+	await native.stream(nativeModel as typeof model, context, {
+		apiKey: "dummy", maxTokens: 2048, thinkingEnabled: true, thinkingBudgetTokens: 1024, maxRetries: 0,
+		onPayload: (value: unknown) => { payload = value as Record<string, unknown>; },
+		fetch: async () => Response.json({ type: "error", error: { type: "invalid_request_error", message: "offline fixture" } }, { status: 400 }),
+	} as Options).result();
+	assert.deepEqual(payload?.thinking, { type: "enabled", budget_tokens: 1024, display: "summarized" });
+});
+
+test("provider idle overrides replace inherited SDK deadlines, but external AbortSignal still wins", async () => {
+	const bridge = new ResponsesWebSocketTransport();
+	try {
+		for (const [override, cancel] of [[0, false], [1000, false], [0, true]] as const) {
+			let headersReached = false;
+			const callerSignal = cancel ? AbortSignal.timeout(20) : undefined;
+			const fakeFetch: typeof fetch = async (_url, init) => new Promise<Response>((resolve, reject) => {
+				const signal = init!.signal!;
+				const abort = () => { clearTimeout(timer); reject(signal.reason); };
+				const timer = setTimeout(() => {
+					headersReached = true; signal.removeEventListener("abort", abort);
+					const events = [{ type: "response.created", response: { id: "resp_timeout", status: "in_progress" } }, { type: "response.completed", response: { id: "resp_timeout", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 0 } } }];
+					resolve(new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } }));
+				}, 60);
+				signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
+			});
+			const options = applyTransportOptions("openai-responses", { transport: "sse", httpIdleTimeoutMs: override }, { httpIdleTimeoutMs: 20 }, { apiKey: "dummy", maxRetries: 0, timeoutMs: 20, signal: callerSignal, fetch: fakeFetch }, bridge, () => {});
+			assert.equal(options.timeoutMs, override || 2147483647);
+			assert.equal(options.signal, callerSignal);
+			const result = await responses.streamSimple(model, context, options).result();
+			assert.equal(headersReached, !cancel);
+			assert.equal(result.stopReason, cancel ? "aborted" : "stop");
+		}
+	} finally { bridge.close(); }
+});
+
+test("auto fallback can finish after its WS handshake timeout without a competing SDK deadline", async (t) => {
+	class StalledSocket extends EventTarget {
+		readyState = 0; binaryType = "arraybuffer";
+		close() { this.readyState = 3; this.dispatchEvent(new Event("close")); }
+		send() { throw new Error("No request should be sent before open"); }
+	}
+	t.mock.method(globalThis, "WebSocket", function () { return new StalledSocket(); } as unknown as typeof WebSocket);
+	const bridge = new ResponsesWebSocketTransport();
+	let notices = 0, requests = 0;
+	try {
+		const options = applyTransportOptions("openai-responses", { transport: "auto", websocketConnectTimeoutMs: 20, httpIdleTimeoutMs: 1000 }, {}, { apiKey: "dummy", timeoutMs: 5, maxRetries: 0, fetch: async () => {
+			requests++;
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			const event = { type: "response.completed", response: { id: "resp_fallback", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 0 } } };
+			return new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+		} }, bridge, () => { notices++; });
+		assert.equal(options.timeoutMs, 2147483647);
+		const result = await responses.streamSimple(model, context, options).result();
+		assert.equal(result.stopReason, "stop");
+		assert.equal(requests, 1); assert.equal(notices, 1);
+	} finally { bridge.close(); }
+});
 
 class WireSocket extends EventTarget {
 	readyState = 1;

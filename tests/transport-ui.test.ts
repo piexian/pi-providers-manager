@@ -52,6 +52,14 @@ test("inherit clears transport without losing timeout overrides", async (t) => {
 	assert.deepEqual(store.readProvider("cpa"), { httpIdleTimeoutMs: 0 });
 });
 
+test("native APIs cannot acquire overrides but existing settings can be cleared", async (t) => {
+	const { store, ui, notifications } = fixture(t, ["transport", "sse", "httpIdleTimeoutMs", "transport", "", "httpIdleTimeoutMs", null], ["1000", ""]);
+	store.updateProvider("anthropic", (p) => { p.transport = "sse"; p.httpIdleTimeoutMs = 100; });
+	await editProviderTransport(ui, store, "anthropic", ["anthropic-messages"]);
+	assert.deepEqual(store.readProvider("anthropic"), {});
+	assert.equal(notifications.filter((notice) => notice.type === "error").length, 2);
+});
+
 test("unsupported model APIs are visible before editing", async (t) => {
 	const { store, ui, menus } = fixture(t, [null]);
 	await editProviderTransport(ui, store, "mixed", ["openai-responses", "anthropic-messages"]);
