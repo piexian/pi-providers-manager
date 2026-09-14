@@ -13,14 +13,18 @@
  * frontmatter 按行处理：只改受管字段，其余行原样保留。
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir, CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { TransportConfigStore } from "../src/transport-config.ts";
+import { editProviderTransport } from "../src/transport-ui.ts";
+import { registerProviderTransports } from "../src/provider-transport-runtime.ts";
 
-const AGENTS_DIR = join(homedir(), ".pi", "agent", "agents");
+const AGENT_DIR = getAgentDir();
+const AGENTS_DIR = join(AGENT_DIR, "agents");
+const transportStore = new TransportConfigStore(join(AGENT_DIR, "provider-transports.json"));
 /** 受管 frontmatter 字段（单行 key: value） */
 const MANAGED_KEYS = ["name", "description", "tools", "model", "thinkingLevel"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -266,8 +270,13 @@ async function createAgent(ctx: ExtensionCommandContext): Promise<void> {
 
 // ==================== 供应商/模型管理 (models.json) ====================
  
-const MODELS_JSON_PATH = join(homedir(), ".pi", "agent", "models.json");
-const API_TYPES = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"] as const;
+const MODELS_JSON_PATH = join(AGENT_DIR, "models.json");
+const API_TYPES = ["openai-completions", "openai-responses", "openai-codex-responses", "azure-openai-responses", "anthropic-messages", "google-generative-ai"] as const;
+const apiItems = (): SelectItem[] => API_TYPES.map((value) => ({
+	value, label: value,
+	description: value === "openai-codex-responses" ? "ChatGPT Codex 专用：需账户 JWT 和 /codex/responses；普通 CPA 保持 openai-responses"
+		: value === "openai-responses" ? "标准 Responses；本插件可配置 WS/SSE" : undefined,
+}));
  
 type ModelEntry = Record<string, unknown>;
 interface ProviderCfg {
@@ -509,7 +518,7 @@ async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
-	const api = await pick(ctx, "API 类型", API_TYPES.map((t) => ({ value: t, label: t })));
+	const api = await pick(ctx, "API 类型", apiItems());
 	if (api === null) return;
 	const rawBase = await ctx.ui.input("baseUrl (openai 系含 /v1；anthropic/gemini 自动去版本段):", "");
 	if (!rawBase?.trim()) return;
@@ -586,7 +595,7 @@ async function editModelEntry(ctx: ExtensionCommandContext, providerId: string):
 		try {
 			if (action === "api") {
 				const v = await pick(ctx, "模型级 api", [
-					...API_TYPES.map((t) => ({ value: t, label: t })),
+					...apiItems(),
 					{ value: "", label: "(清除，用供应商默认)" },
 				]);
 				if (v !== null) {
@@ -912,7 +921,7 @@ const ANTHROPIC_COMPAT: CompatKeyDef[] = [
 ];
 
 function compatKeysForApi(api: string | undefined): CompatKeyDef[] {
-	if (api === "openai-responses") return OPENAI_RESPONSES_COMPAT;
+	if (api === "openai-responses" || api === "openai-codex-responses" || api === "azure-openai-responses") return OPENAI_RESPONSES_COMPAT;
 	if (api === "anthropic-messages") return ANTHROPIC_COMPAT;
 	return OPENAI_COMPLETIONS_COMPAT;
 }
@@ -1206,6 +1215,7 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 			{ value: "baseUrl", label: `baseUrl: ${p.baseUrl ?? "(无)"}`, description: "编辑；anthropic/gemini 自动去除结尾版本段" },
 			{ value: "apiKey", label: `apiKey: ${apiKeyLabel}`, description: "支持 $ENV_VAR 引用" },
 			{ value: "api", label: `API 类型: ${p.api ?? "(无)"}`, description: "修改 API 类型" },
+			{ value: "transport", label: "传输方式 / 超时", description: "供应商级 WS、SSE、回退策略；保存后 /reload 生效" },
 			{ value: "authHeader", label: `authHeader: ${p.authHeader === undefined ? "(默认)" : String(p.authHeader)}`, description: "是否以 Authorization: Bearer 携带 key" },
 			{ value: "name", label: `name: ${typeof p.name === "string" ? p.name : "(无)"}`, description: "显示名称" },
 			{ value: "delete", label: "删除此供应商", description: "含全部模型定义" },
@@ -1218,6 +1228,15 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 			else if (action === "edit") await editModelEntry(ctx, providerId);
 			else if (action === "remove") await removeModel(ctx, providerId);
 			else if (action === "overrides") await manageModelOverrides(ctx, providerId);
+			else if (action === "transport") {
+				const models = ctx.modelRegistry.getAll().filter((model) => model.provider === providerId);
+				const apis = models.length ? models.map((model) => model.api) : [p.api ?? "(未配置 API)"];
+				await editProviderTransport({
+					pick: (title, items) => pick(ctx, title, items),
+					input: (title, placeholder) => ctx.ui.input(title, placeholder),
+					notify: (message, type) => ctx.ui.notify(message, type),
+				}, transportStore, providerId, apis);
+			}
 			else if (action === "compat") {
 				await editCompatRecord(
 					ctx,
@@ -1285,7 +1304,7 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 				}
 
 			} else if (action === "api") {
-				const v = await pick(ctx, "API 类型", API_TYPES.map((t) => ({ value: t, label: t })));
+				const v = await pick(ctx, "API 类型", apiItems());
 				if (v !== null) {
 					const cfg = loadModelsJson();
 					const target = cfg.providers[providerId];
@@ -1341,6 +1360,7 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 }
  
 export default function agentManager(pi: ExtensionAPI) {
+	registerProviderTransports(pi, transportStore, CONFIG_DIR_NAME);
 	pi.registerCommand("agents", {
 		description: "交互式管理子代理 (~/.pi/agent/agents/*.md)",
 		handler: async (_args, ctx) => {
