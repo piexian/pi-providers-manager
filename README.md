@@ -21,8 +21,8 @@ pi 编码代理的交互式供应商/模型/子代理管理扩展。
 - 供应商级传输：继承 / auto / sse / websocket / websocket-cached，以及 WS 握手、流空闲超时；标准 Responses 可实际走 WS
 - API 选择补充 Codex / Azure Responses，并提示 Codex 专用鉴权与路径限制
 - modelOverrides：单模型最终覆盖层（compat / headers / reasoning / thinkingLevelMap / contextWindow / maxTokens）
-- 模型级编辑：api 类型、compat（完整键集，显示 provider 级已设值）、headers 客户端指纹、thinkingLevelMap、input 模态、contextWindow、maxTokens、baseUrl 覆盖
-- 删除模型
+- 模型级编辑：api 类型、compat（完整键集，显示 provider 级已设值）、headers 客户端指纹、thinkingLevelMap、input 模态、contextWindow、maxTokens、baseUrl 覆盖；编辑完一个模型回到模型列表，可继续编辑其它模型，esc 才返回供应商菜单
+- 删除模型：连续删除，esc 返回供应商菜单
 - models.json 按 JSONC 读写，手写注释与 BOM 均保留
 
 ### /agents

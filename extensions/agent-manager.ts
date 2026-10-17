@@ -409,29 +409,34 @@ async function addModelsFromEndpoint(ctx: ExtensionCommandContext, providerId: s
 }
  
 async function removeModel(ctx: ExtensionCommandContext, providerId: string): Promise<void> {
-	const models = loadModelsJson().providers[providerId].models ?? [];
-	if (models.length === 0) {
-		ctx.ui.notify("没有模型可删", "warning");
-		return;
-	}
+	// 循环删除，esc 结束；每次重读列表反映上一次删除
+	for (;;) {
+		const models = loadModelsJson().providers[providerId].models ?? [];
+		if (models.length === 0) {
+			ctx.ui.notify("没有模型可删", "warning");
+			return;
+		}
 
-	const chosen = await pick(
-		ctx,
-		"删除模型",
-		models.map((m) => ({
-			value: String(m.id),
-			label: String(m.id),
-			description: typeof m.name === "string" ? m.name : undefined,
-		})),
-	);
-	if (chosen === null) return;
-	const ok = await ctx.ui.confirm("删除模型", `从 ${providerId} 删除 ${chosen}？`);
-	if (!ok) return;
-	const cfg = loadModelsJson();
-	const p = cfg.providers[providerId];
-	p.models = (p.models ?? []).filter((m) => m.id !== chosen);
-	saveModelsJson(cfg);
-	ctx.ui.notify("已删除", "info");
+		const chosen = await pick(
+			ctx,
+			`删除模型 (esc 结束, 当前 ${models.length} 个)`,
+			models.map((m) => ({
+				value: String(m.id),
+				label: String(m.id),
+				description: typeof m.name === "string" ? m.name : undefined,
+			})),
+		);
+		if (chosen === null) return;
+
+		const ok = await ctx.ui.confirm("删除模型", `从 ${providerId} 删除 ${chosen}？`);
+		if (!ok) continue;
+
+		const cfg = loadModelsJson();
+		const p = cfg.providers[providerId];
+		p.models = (p.models ?? []).filter((m) => m.id !== chosen);
+		saveModelsJson(cfg);
+		ctx.ui.notify(`已删除 ${chosen}`, "info");
+	}
 }
  
 async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
@@ -464,23 +469,30 @@ async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
  
 /** 编辑单个模型条目（模型级覆盖） */
 async function editModelEntry(ctx: ExtensionCommandContext, providerId: string): Promise<void> {
-	const models = loadModelsJson().providers[providerId].models ?? [];
-	if (models.length === 0) {
-		ctx.ui.notify("没有模型可编辑", "warning");
-		return;
+	// 循环选模型，esc 结束；编辑完一个模型后回到模型列表继续
+	for (;;) {
+		const models = loadModelsJson().providers[providerId].models ?? [];
+		if (models.length === 0) {
+			ctx.ui.notify("没有模型可编辑", "warning");
+			return;
+		}
+
+		const modelId = await pick(
+			ctx,
+			`选择要编辑的模型 (esc 结束, 当前 ${models.length} 个)`,
+			models.map((m) => ({
+				value: String(m.id),
+				label: String(m.id),
+				description: [m.api, typeof m.name === "string" ? m.name : ""].filter(Boolean).join(" • ") || undefined,
+			})),
+		);
+		if (modelId === null) return;
+
+		await editModelFields(ctx, providerId, modelId);
 	}
-
-	const modelId = await pick(
-		ctx,
-		"选择要编辑的模型",
-		models.map((m) => ({
-			value: String(m.id),
-			label: String(m.id),
-			description: [m.api, typeof m.name === "string" ? m.name : ""].filter(Boolean).join(" • ") || undefined,
-		})),
-	);
-	if (modelId === null) return;
-
+}
+/** 编辑指定模型的字段菜单（esc 返回模型列表） */
+async function editModelFields(ctx: ExtensionCommandContext, providerId: string, modelId: string): Promise<void> {
 	// 每次操作都重读文件，避免覆盖并发修改
 	const getEntry = (): ModelEntry | undefined =>
 		(loadModelsJson().providers[providerId].models ?? []).find((m) => m.id === modelId);

@@ -17,9 +17,9 @@ Registers two TUI slash commands:
 - API-specific model lists: OpenAI `/models`, Anthropic `/v1/models`, Gemini `/v1beta/models`; native pagination, key interpolation/escapes, no `!command` execution
 - Manual model addition
 - Provider-aware models.dev metadata; ambiguous matches require selecting a source or skipping metadata rather than using the first entry
-- Per-model editing: api type, headers (client fingerprint), thinkingLevelMap, reasoning_effort, input modalities, contextWindow, maxTokens, baseUrl override
+- Per-model editing: api type, headers (client fingerprint), thinkingLevelMap, reasoning_effort, input modalities, contextWindow, maxTokens, baseUrl override; saving returns to the model list so another model can be edited, esc exits to the provider menu
 - contextWindow / maxTokens accept positive safe integers only; fractions are rejected, never rounded
-- Remove models
+- Remove models: loops until esc instead of leaving after one deletion
 - Per-provider transport and handshake/stream-idle timeouts, with actual WebSocket support for standard Responses
 - Codex and Azure Responses API choices with Codex-specific authentication/path warnings
 

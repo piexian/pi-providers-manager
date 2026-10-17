@@ -32,6 +32,7 @@ test("real provider menus reject fractional caps, resolve native lists and disam
 		const ctx = { mode: "tui", ui: {
 			notify: (text: string) => notices.push(text),
 			input: async () => { assert.ok(inputs.length, "unexpected input"); return inputs.shift(); },
+			confirm: async () => true,
 			custom: (build: (tui: unknown, theme: unknown, kb: unknown, done: (value: unknown) => void) => { handleInput(data: string): void }) => new Promise((resolve, reject) => {
 				assert.ok(choices.length, "unexpected menu"); let done = false;
 				const component = build({ requestRender: () => {} }, theme, {}, (value) => { done = true; resolve(value); });
@@ -57,13 +58,30 @@ test("real provider menus reject fractional caps, resolve native lists and disam
 	});
 	await t.test("model cap invalid input does not write JSON", async () => {
 		const before = JSON.stringify(initial()); writeFileSync(path, before);
-		const notices = await run(["cpa", "edit", "dummy-model", "maxTokens", null, null, null], ["0.1"]);
+		const notices = await run(["cpa", "edit", "dummy-model", "maxTokens", null, null, null, null], ["0.1"]);
 		assert.equal(readFileSync(path, "utf8"), before); assert.ok(notices.some((text) => text.includes("正安全整数")));
 	});
 	await t.test("override cap invalid input does not write JSON", async () => {
 		const before = JSON.stringify(initial()); writeFileSync(path, before);
 		const notices = await run(["cpa", "overrides", "dummy-model", "maxTokens", null, null, null, null], ["0.1"]);
 		assert.equal(readFileSync(path, "utf8"), before); assert.ok(notices.some((text) => text.includes("正安全整数")));
+	});
+	await t.test("edit returns to the model list so the next model can be edited", async () => {
+		const data = initial();
+		data.providers.cpa.models.push({ id: "second-model", maxTokens: 100 });
+		writeFileSync(path, JSON.stringify(data));
+		await run(["cpa", "edit", "dummy-model", "maxTokens", null, "second-model", "maxTokens", null, null, null, null], ["300", "400"]);
+		const models = JSON.parse(readFileSync(path, "utf8")).providers.cpa.models;
+		assert.equal(models.find((m: { id: string }) => m.id === "dummy-model").maxTokens, 300);
+		assert.equal(models.find((m: { id: string }) => m.id === "second-model").maxTokens, 400);
+	});
+	await t.test("remove loops until escape instead of returning to the provider menu", async () => {
+		const data: ReturnType<typeof initial> = initial();
+		data.providers.cpa.models.push({ id: "second-model", maxTokens: 100 });
+		writeFileSync(path, JSON.stringify(data));
+		await run(["cpa", "remove", "dummy-model", "second-model", null, null], []);
+		const remaining = JSON.parse(readFileSync(path, "utf8")).providers.cpa.models;
+		assert.deepEqual(remaining, []);
 	});
 	await t.test("ambiguous metadata requires the chosen vendor or an explicit skip", async () => {
 		for (const choice of ["b / shared", "跳过元数据"]) {
