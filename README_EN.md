@@ -13,11 +13,12 @@ Registers two TUI slash commands:
 
 ### /providers
 
-- Create/delete providers (baseUrl, apiKey, API type)
+- Create/delete providers (base URL without the version segment, apiKey, API type); the stored `baseUrl` is derived from the API type
 - API-specific model lists: OpenAI `/models`, Anthropic `/v1/models`, Gemini `/v1beta/models`; native pagination, key interpolation/escapes, no `!command` execution
 - Manual model addition
 - Provider-aware models.dev metadata; ambiguous matches require selecting a source or skipping metadata rather than using the first entry
-- Per-model editing: api type, headers (client fingerprint), thinkingLevelMap, reasoning_effort, input modalities, contextWindow, maxTokens, baseUrl override; saving returns to the model list so another model can be edited, esc exits to the provider menu
+- Per-model editing: api type, headers (client fingerprint), thinkingLevelMap, reasoning_effort, input modalities, contextWindow, maxTokens; changing a model's api re-derives its endpoint with no manual input, and per-model endpoint pinning lives in the provider menu's advanced override entry. Saving returns to the model list so another model can be edited, esc exits to the provider menu
+- Per-provider editing includes the canonical base (with the derived endpoint shown beside it), an advanced verbatim endpoint entry, and an advanced per-model endpoint entry
 - contextWindow / maxTokens accept positive safe integers only; fractions are rejected, never rounded
 - Remove models: loops until esc instead of leaving after one deletion
 - Per-provider transport and handshake/stream-idle timeouts, with actual WebSocket support for standard Responses
@@ -29,6 +30,19 @@ Registers two TUI slash commands:
 - Edit model / thinkingLevel / tools / description / system prompt body
 - Complete multiline YAML value replacement with comments, BOM, newlines and prompt preserved; validate before atomic writes
 - Create / delete subagents
+
+## Base URL and endpoint
+
+Pi hands `model.baseUrl` to each SDK as `baseURL` without normalising it, and the SDKs disagree about where the version segment belongs: the OpenAI SDK requests `/chat/completions` and `/responses` (so the base must carry the segment), while the Anthropic SDK requests `/v1/messages` and the Google SDK `/v1beta/...` (so the base must not). The plugin therefore keeps one canonical base per provider and derives the stored endpoint from the API type:
+
+| API type | Stored `baseUrl` | Requested path |
+|---|---|---|
+| `openai-completions` / `openai-responses` / `openai-codex-responses` | `http://host:3000/v1` | `/v1/chat/completions`, `/v1/responses` |
+| `anthropic-messages` | `http://host:3000` | `/v1/messages` |
+| `google-generative-ai` | `http://host:3000` | `/v1beta/...` |
+| `mistral-conversations` | `http://host:3000` | versioned path inside the SDK |
+
+A base keeps host and path prefix only; the trailing version segment is optional, and prefixes such as `/compatible-mode` or `/openai` are never swallowed. An endpoint already carrying a custom segment like `/v4` is kept as-is instead of being rewritten to `/v1`. Switching API type re-derives the provider endpoint plus every model that pins its own, so changing protocol never requires retyping an address. Gateways with an unusual shape go through the advanced endpoint entry, which stores the value verbatim.
 
 ## Provider transport
 
