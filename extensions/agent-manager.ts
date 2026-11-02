@@ -23,6 +23,7 @@ import { editProviderTransport } from "../src/transport-ui.ts";
 import { registerProviderTransports } from "../src/provider-transport-runtime.ts";
 import { parseAgentFields, setAgentField } from "../src/agent-frontmatter.ts";
 import { fetchEndpointModels, modelsListUrl, positiveInteger, resolveSecret } from "../src/provider-models.ts";
+import { baseUrlMatchesApi, canonicalBase, deriveBaseUrl } from "../src/base-url.ts";
 import { loadModelsDev, lookupModelsDev, modelsDevCandidates, type ModelsDevEntry, type ModelsDevIndex } from "../src/models-dev.ts";
 
 const AGENT_DIR = getAgentDir();
@@ -282,13 +283,6 @@ function buildModelsListHeaders(api: string | undefined, apiKey?: string): Recor
 	return { Authorization: `Bearer ${apiKey}` };
 }
  
-/** anthropic / gemini SDK 会在 baseUrl 后自拼版本化路径（/v1/messages、/v1beta/...），结尾版本段必须剥掉；openai 系则要求保留 */
-const VERSION_SUFFIX_RE = /\/v\d+[a-z]*\/?$/i;
-function stripVersionSuffix(api: string | undefined, baseUrl: string): { url: string; stripped: boolean } {
-	if (api !== "anthropic-messages" && api !== "google-generative-ai") return { url: baseUrl, stripped: false };
-	const stripped = VERSION_SUFFIX_RE.test(baseUrl);
-	return { url: baseUrl.replace(VERSION_SUFFIX_RE, ""), stripped };
-}
  
  
 /** 按 models.dev 元数据构建模型条目 */
@@ -438,6 +432,44 @@ async function removeModel(ctx: ExtensionCommandContext, providerId: string): Pr
 		ctx.ui.notify(`已删除 ${chosen}`, "info");
 	}
 }
+/** 模型级端点覆盖：填基址或完整端点都可，按该模型生效的 API 类型拼接后再写入。 */
+async function editModelEndpoints(ctx: ExtensionCommandContext, providerId: string): Promise<void> {
+	for (;;) {
+		const cfg = loadModelsJson();
+		const provider = cfg.providers[providerId];
+		const models = provider?.models ?? [];
+		if (models.length === 0) {
+			ctx.ui.notify("没有模型可配置", "warning");
+			return;
+		}
+
+		const providerApi = typeof provider?.api === "string" ? provider.api : undefined;
+		const chosen = await pick(ctx, `模型端点覆盖 (esc 结束, 当前 ${models.length} 个)`, models.map((m) => ({
+			value: String(m.id), label: String(m.id),
+			description: `${typeof m.baseUrl === "string" ? m.baseUrl : "继承供应商端点"}`,
+		})));
+		if (chosen === null) return;
+		const entry = models.find((m) => m.id === chosen);
+		if (!entry) continue;
+
+		const inherited = typeof provider?.baseUrl === "string" ? provider.baseUrl : "";
+		const stored = typeof entry.baseUrl === "string" ? entry.baseUrl : inherited;
+		const v = await ctx.ui.input(`${chosen} 端点 (留空清除覆盖):`, stored);
+		if (v === undefined) return;
+
+		if (!v.trim()) {
+			delete entry.baseUrl;
+			saveModelsJson(cfg);
+			ctx.ui.notify("已清除，改回继承供应商端点", "info");
+			continue;
+		}
+
+		const url = deriveBaseUrl(typeof entry.api === "string" ? entry.api : providerApi, v.trim());
+		entry.baseUrl = url;
+		saveModelsJson(cfg);
+		ctx.ui.notify(`已保存（${chosen} 端点 ${url}）`, "info");
+	}
+}
  
 async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
 	const id = await ctx.ui.input("供应商 id (如 my-proxy):", "");
@@ -450,9 +482,10 @@ async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
 
 	const api = await pick(ctx, "API 类型", apiItems());
 	if (api === null) return;
-	const rawBase = await ctx.ui.input("baseUrl (openai 系含 /v1；anthropic/gemini 自动去版本段):", "");
+	const rawBase = await ctx.ui.input("基址 (scheme://host[:port][/路径]，可不带 /v1):", "");
 	if (!rawBase?.trim()) return;
-	const { url, stripped } = stripVersionSuffix(api, rawBase.trim());
+	const base = canonicalBase(rawBase.trim());
+	const url = deriveBaseUrl(api, base);
 	const apiKey = await ctx.ui.input("apiKey (支持 $ENV_VAR，可留空):", "");
 
 	const cfg = loadModelsJson();
@@ -463,7 +496,7 @@ async function createProvider(ctx: ExtensionCommandContext): Promise<void> {
 		models: [],
 	};
 	saveModelsJson(cfg);
-	ctx.ui.notify(stripped ? `已创建供应商 ${pid}（baseUrl 自动去除结尾版本段 → ${url}）` : `已创建供应商 ${pid}，接着添加模型`, "info");
+	ctx.ui.notify(`已创建供应商 ${pid}（基址 ${base} → 端点 ${url}）`, "info");
 	await addModelsFromEndpoint(ctx, pid);
 }
  
@@ -525,7 +558,6 @@ async function editModelFields(ctx: ExtensionCommandContext, providerId: string,
 			{ value: "input", label: `input: ${Array.isArray(m.input) ? m.input.join("+") : "(默认 text)"}`, description: "输入模态" },
 			{ value: "contextWindow", label: `contextWindow: ${m.contextWindow ?? "(默认 128000)"}`, description: "上下文窗口" },
 			{ value: "maxTokens", label: `maxTokens: ${m.maxTokens ?? "(默认 16384)"}`, description: "最大输出 tokens" },
-			{ value: "baseUrl", label: `baseUrl: ${typeof m.baseUrl === "string" ? m.baseUrl : "(供应商默认)"}`, description: "模型级端点覆盖（如 anthropic 模型去 /v1）" },
 		]);
 		if (action === null) return;
 
@@ -536,8 +568,18 @@ async function editModelFields(ctx: ExtensionCommandContext, providerId: string,
 					{ value: "", label: "(清除，用供应商默认)" },
 				]);
 				if (v !== null) {
-					saveEntry((e) => { v ? (e.api = v) : delete e.api; });
-					ctx.ui.notify("已保存", "info");
+					const provider = loadModelsJson().providers[providerId];
+					const providerApi = typeof provider?.api === "string" ? provider.api : undefined;
+					const providerBase = typeof provider?.baseUrl === "string" ? provider.baseUrl : "";
+					const current = (typeof m.baseUrl === "string" && m.baseUrl) || providerBase;
+					const target = v || providerApi;
+					const next = current && target ? deriveBaseUrl(target, current) : "";
+					saveEntry((e) => {
+						if (v) e.api = v; else delete e.api;
+						// 端点形态跟着 API 类型走：与继承到的供应商端点一致就不写覆盖，否则为该模型派生并固定。
+						if (!v || !next || next === providerBase) delete e.baseUrl; else e.baseUrl = next;
+					});
+					ctx.ui.notify(next && next !== providerBase ? `已保存（该模型端点派生为 ${next}）` : "已保存", "info");
 				}
 
 			} else if (action === "headers") {
@@ -596,13 +638,6 @@ async function editModelFields(ctx: ExtensionCommandContext, providerId: string,
 				if (v !== undefined) {
 					const n = positiveInteger(v);
 					saveEntry((e) => { n === undefined ? delete e[action] : (e[action] = n); });
-					ctx.ui.notify("已保存", "info");
-				}
-
-			} else if (action === "baseUrl") {
-				const v = await ctx.ui.input("模型级 baseUrl (留空清除):", typeof m.baseUrl === "string" ? m.baseUrl : "");
-				if (v !== undefined) {
-					saveEntry((e) => { v.trim() ? (e.baseUrl = v.trim()) : delete e.baseUrl; });
 					ctx.ui.notify("已保存", "info");
 				}
 
@@ -1140,7 +1175,9 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 			{ value: "overrides", label: `modelOverrides: ${overrideCount} 个`, description: "单模型最终覆盖层（compat/headers/参数）" },
 			{ value: "compat", label: `compat: ${compatCount} 键`, description: "供应商级缓存/思考协议兼容开关，全部模型继承" },
 			{ value: "headers", label: `headers: ${headerCount} 个`, description: "供应商级请求头，全部模型继承" },
-			{ value: "baseUrl", label: `baseUrl: ${p.baseUrl ?? "(无)"}`, description: "编辑；anthropic/gemini 自动去除结尾版本段" },
+			{ value: "baseUrl", label: `基址: ${p.baseUrl ? canonicalBase(p.baseUrl) : "(无)"} • 端点: ${p.baseUrl ?? "(无)"}`, description: "编辑基址，端点按接口类型自动拼接" },
+			{ value: "endpoint", label: "端点覆盖 (高级)", description: "直接写入存储的 baseUrl，供形态不同的网关" },
+			{ value: "modelEndpoint", label: "模型端点覆盖 (高级)", description: "为单个模型固定端点；模型界面已不再提供该字段" },
 			{ value: "apiKey", label: `apiKey: ${apiKeyLabel}`, description: "支持 $ENV_VAR 引用" },
 			{ value: "api", label: `API 类型: ${p.api ?? "(无)"}`, description: "修改 API 类型" },
 			{ value: "transport", label: "传输方式 / 超时", description: "供应商级 WS、SSE、回退策略；保存后 /reload 生效" },
@@ -1196,14 +1233,30 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 				});
 
 			} else if (action === "baseUrl") {
-				const v = await ctx.ui.input("baseUrl:", p.baseUrl ?? "");
+				const v = await ctx.ui.input("基址 (scheme://host[:port][/路径]):", p.baseUrl ? canonicalBase(p.baseUrl) : "");
 				if (v?.trim()) {
-					const { url, stripped } = stripVersionSuffix(typeof p.api === "string" ? p.api : undefined, v.trim());
+					const base = canonicalBase(v.trim());
+					const url = deriveBaseUrl(typeof p.api === "string" ? p.api : undefined, base);
 					const cfg = loadModelsJson();
 					cfg.providers[providerId].baseUrl = url;
 					saveModelsJson(cfg);
-					ctx.ui.notify(stripped ? `已保存（自动去除结尾版本段 → ${url}）` : "已保存", "info");
+					ctx.ui.notify(`已保存（端点 ${url}）`, "info");
 				}
+
+			} else if (action === "endpoint") {
+				const v = await ctx.ui.input("端点（原样写入存储值，留空清除）:", p.baseUrl ?? "");
+				if (v !== undefined) {
+					const url = v.trim();
+					const api = typeof p.api === "string" ? p.api : undefined;
+					const cfg = loadModelsJson();
+					if (url) cfg.providers[providerId].baseUrl = url; else delete cfg.providers[providerId].baseUrl;
+					saveModelsJson(cfg);
+					ctx.ui.notify(url && api && !baseUrlMatchesApi(api, url)
+						? `已保存（注意：该端点与 ${api} 的常见形态不同）` : "已保存", "info");
+				}
+
+			} else if (action === "modelEndpoint") {
+				await editModelEndpoints(ctx, providerId);
 
 			} else if (action === "apiKey") {
 				const mode = await pick(ctx, "apiKey", [
@@ -1237,11 +1290,12 @@ async function manageProvider(ctx: ExtensionCommandContext, providerId: string):
 					const cfg = loadModelsJson();
 					const target = cfg.providers[providerId];
 					target.api = v;
-					const baseUrl = typeof target.baseUrl === "string" ? target.baseUrl : "";
-					const { url, stripped } = stripVersionSuffix(v, baseUrl);
-					if (stripped) target.baseUrl = url;
+					for (const entry of [target, ...(target.models ?? [])] as { baseUrl?: unknown }[]) {
+						if (typeof entry.baseUrl !== "string") continue;
+						entry.baseUrl = deriveBaseUrl(v, entry.baseUrl);
+					}
 					saveModelsJson(cfg);
-					ctx.ui.notify(stripped ? `已保存（baseUrl 自动去除结尾版本段 → ${url}）` : "已保存", "info");
+					ctx.ui.notify(`已保存（端点 ${target.baseUrl}）`, "info");
 				}
 
 			} else if (action === "authHeader") {

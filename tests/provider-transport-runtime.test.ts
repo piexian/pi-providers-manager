@@ -80,7 +80,30 @@ test("fallback warns once per session across concurrent requests and providers, 
 	assert.equal(probe.httpRequests, 3);
 	assert.equal(f.notices.length, 1);
 	assert.match(f.notices[0], /connect timeout \(60 ms\)/);
-	assert.deepEqual(f.session.entries, [{ type: "custom", customType: "providers-manager:transport-fallback-warning", data: { sessionId: "session-1", provider: "cpa" } }]);
+	assert.deepEqual(f.session.entries, [{ type: "custom", customType: "providers-manager:transport-fallback-warning",
+		data: { sessionId: "session-1", provider: "cpa", kind: "fallback", transport: "auto", reason: "WebSocket connect timeout (60 ms)" } }]);
+});
+
+test("a WS replay is recorded once per session and stays silent in the UI", async (t) => {
+	const f = fixture(t);
+	f.store.updateProvider("cpa", (p) => { p.transport = "websocket-cached"; p.httpIdleTimeoutMs = 0; });
+	f.start();
+	t.mock.method(ResponsesWebSocketTransport.prototype, "createFetch",
+		(options: Parameters<ResponsesWebSocketTransport["createFetch"]>[0]) => async () => {
+			options.onReplay?.("WebSocket closed before terminal response (code 1006, unclean, readyState 3, request sent 0.9s ago, frames 0, socket age 2.1s)");
+			return new Response("OK");
+		});
+	for (let attempt = 0; attempt < 2; attempt++) {
+		f.registered.get("cpa")!.streamSimple({ ...model, provider: "cpa" }, context, { fetch: async () => new Response("unused") });
+		const response = await f.calls.at(-1)!.options.fetch!("https://offline.invalid/v1/responses");
+		assert.equal(await response.text(), "OK");
+	}
+	assert.deepEqual(f.notices, [], "a recovered replay must not warn");
+	assert.equal(f.session.entries.length, 1, "recorded once per session");
+	const data = f.session.entries[0]!.data as Record<string, unknown>;
+	assert.equal(data.kind, "replay");
+	assert.equal(data.transport, "websocket-cached");
+	assert.match(String(data.reason), /frames 0/);
 });
 
 test("reload/resume preserves the warning marker; a new or forked session warns again", async (t) => {
