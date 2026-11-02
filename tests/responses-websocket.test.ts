@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
+import { WebSocketServer } from "ws";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { ResponsesWebSocketTransport } from "../src/responses-websocket.ts";
+import { ResponsesWebSocketTransport, nativeFactory, createWebSocketFactory } from "../src/responses-websocket.ts";
 import type { ResponsesWebSocketOptions, ResponsesWebSocketFactory } from "../src/responses-websocket.ts";
 
 const endpoint = "https://provider.invalid/proxy/v1/responses?route=test";
@@ -14,6 +15,11 @@ const input = [{ role: "user", content: "hello" }];
 const output = [{ type: "message", id: "msg_1", role: "assistant", content: [{ type: "output_text", text: "hello", annotations: [] }] }];
 
 class FakeSocket extends EventTarget {
+	ping?: () => void;
+	constructor(keepAlive = false) {
+		super();
+		if (keepAlive) this.ping = () => {};
+	}
 	readyState = 0;
 	binaryType = "blob";
 	sent: Record<string, unknown>[] = [];
@@ -36,6 +42,10 @@ class FakeSocket extends EventTarget {
 	raw(data: unknown): void { this.dispatchEvent(new MessageEvent("message", { data })); }
 	error(): void { this.dispatchEvent(new Event("error")); }
 	remoteClose(): void { this.readyState = 3; this.dispatchEvent(new Event("close")); }
+	remoteCloseAt(code: number, reason = "", wasClean = true): void {
+		this.readyState = 3;
+		this.dispatchEvent(Object.assign(new Event("close"), { code, reason, wasClean }));
+	}
 	send(data: string): void {
 		assert.equal(this.readyState, 1);
 		const body = JSON.parse(data) as Record<string, unknown>;
@@ -45,13 +55,13 @@ class FakeSocket extends EventTarget {
 	close(): void { this.closed++; this.readyState = 3; this.dispatchEvent(new Event("close")); }
 }
 
-function harness(t: TestContext, settings: { autoOpen?: boolean; transport?: ResponsesWebSocketOptions["transport"]; sessionId?: string; connectTimeoutMs?: number; idleTimeoutMs?: number; onSend?: FakeSocket["onSend"] } = {}) {
+function harness(t: TestContext, settings: { autoOpen?: boolean; transport?: ResponsesWebSocketOptions["transport"]; sessionId?: string; connectTimeoutMs?: number; idleTimeoutMs?: number; maxReplay?: number; keepAlive?: boolean; onSend?: FakeSocket["onSend"] } = {}) {
 	const sockets: FakeSocket[] = [];
 	const handshakes: { url: string; headers: Record<string, string> }[] = [];
-	const fallbacks: Request[] = [];
 	const notices: string[] = [];
+	const fallbacks: Request[] = [];
 	const factory: ResponsesWebSocketFactory = (url, options) => {
-		const socket = new FakeSocket();
+		const socket = new FakeSocket(settings.keepAlive);
 		socket.onSend = settings.onSend;
 		sockets.push(socket);
 		handshakes.push({ url, headers: options.headers });
@@ -70,6 +80,7 @@ function harness(t: TestContext, settings: { autoOpen?: boolean; transport?: Res
 	const options: ResponsesWebSocketOptions = {
 		transport: settings.transport ?? "websocket", sessionId: settings.sessionId,
 		connectTimeoutMs: settings.connectTimeoutMs ?? 1000, idleTimeoutMs: settings.idleTimeoutMs ?? 1000,
+		maxReplay: settings.maxReplay,
 		fallbackFetch, onFallback: (reason) => notices.push(reason),
 	};
 	const fetch = transport.createFetch(options);
@@ -373,13 +384,167 @@ for (const [label, event, expected] of [
 
 for (const action of ["error", "remoteClose"] as const) {
 	test(`${action} after send cannot look like successful empty output`, async (t) => {
-		const h = harness(t, { transport: "auto" });
+		const h = harness(t, { transport: "auto", maxReplay: 0 });
 		const response = await h.request();
 		h.sockets[0][action]();
 		await assert.rejects(response.text(), /WebSocket/);
 		assert.equal(h.fallbacks.length, 0);
 	});
 }
+
+for (const mode of ["websocket", "websocket-cached", "auto"] as const) {
+	test(`${mode} appends close facts to post-handshake failures and keeps notices generic`, async (t) => {
+		const h = harness(t, { transport: mode, sessionId: "session", maxReplay: 0 });
+		const response = await h.request();
+		h.sockets[0].remoteCloseAt(1009, "message too big");
+		let message = "";
+		await assert.rejects(response.text(), (error: Error) => { message = error.message; return true; });
+		assert.match(message, /WebSocket closed before terminal response/);
+		assert.match(message, /code 1009/);
+		assert.match(message, /reason "message too big"/);
+		assert.match(message, /request sent .* ago/);
+		assert.match(message, /frames 0/);
+		assert.match(message, /socket age/);
+		assert.equal(h.fallbacks.length, 0, "post-handshake failure never falls back over HTTP");
+		assert.deepEqual(h.notices, [], "close facts stay out of fallback notices");
+	});
+}
+
+test("frame count separates a silent drop from a mid-stream break", async (t) => {
+	const h = harness(t, { transport: "websocket" });
+	const response = await h.request();
+	h.sockets[0].message({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, content_index: 0, delta: "hi" });
+	h.sockets[0].remoteClose();
+	let message = "";
+	await assert.rejects(response.text(), (error: Error) => { message = error.message; return true; });
+	assert.match(message, /frames 1/);
+});
+
+test("a pooled socket is dropped at the link ceiling even when the stream idle timeout is longer", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness(t, { sessionId: "session", idleTimeoutMs: 500_000 });
+	const response = await h.request();
+	complete(h.sockets[0]);
+	t.mock.timers.tick(60_000);
+	assert.equal(h.sockets[0].closed, 0, "still pooled after 60 s");
+	t.mock.timers.tick(50_001);
+	assert.equal(h.sockets[0].closed, 1, "pooled at the 110 s ceiling, not the configured 500 s");
+	assert.equal(h.sockets[0].listenerCount, 0);
+	await response.text();
+});
+
+test("a zero stream idle timeout still pools with the ceiling instead of forever", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness(t, { sessionId: "session", idleTimeoutMs: 0 });
+	const response = await h.request();
+	complete(h.sockets[0]);
+	t.mock.timers.tick(109_999);
+	assert.equal(h.sockets[0].closed, 0);
+	t.mock.timers.tick(2);
+	assert.equal(h.sockets[0].closed, 1);
+	await response.text();
+});
+
+test("the ws factory reports the HTTP status of a rejected upgrade", async (t) => {
+	const { base } = await localServer(t);
+	const transport = new ResponsesWebSocketTransport(createWebSocketFactory(0));
+	t.after(() => transport.close());
+	const fetch = transport.createFetch({ transport: "websocket", connectTimeoutMs: 5_000,
+		fallbackFetch: async () => { throw new Error("unexpected HTTP fallback"); } });
+	await assert.rejects(fetch(`${base}/v1/responses`, { method: "POST", headers: dummyHeaders, body: "{}" }),
+		/WebSocket handshake failed: HTTP 404/);
+});
+
+test("the ws factory keeps a pooled socket alive with ping frames", async (t) => {
+	const server = await new Promise<WebSocketServer>((resolve) => {
+		const created = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+		created.on("listening", () => resolve(created));
+	});
+	const address = server.address();
+	assert.ok(address && typeof address !== "string");
+	let pings = 0;
+	const wire: Record<string, unknown>[] = [];
+	server.on("connection", (socket) => {
+		socket.on("ping", () => { pings++; });
+		socket.on("message", (data) => {
+			wire.push(JSON.parse(data.toString()) as Record<string, unknown>);
+			socket.send(JSON.stringify({ type: "response.completed", response: { id: "ping_1", status: "completed", output: [] } }));
+		});
+	});
+	t.after(() => { server.close(); });
+	const transport = new ResponsesWebSocketTransport(createWebSocketFactory(30));
+	t.after(() => transport.close());
+	const fetch = transport.createFetch({ transport: "websocket", sessionId: "session",
+		connectTimeoutMs: 1_000, idleTimeoutMs: 500_000,
+		fallbackFetch: async () => { throw new Error("unexpected HTTP fallback"); } });
+	const response = await fetch(`http://127.0.0.1:${address.port}/v1/responses`,
+		{ method: "POST", headers: dummyHeaders, body: JSON.stringify({ model: "dummy", input, stream: true }) });
+	await response.text();
+	assert.equal(wire[0]?.type, "response.create");
+	await delay(160);
+	assert.ok(pings >= 2, `expected ping frames while the socket stayed pooled, saw ${pings}`);
+});
+
+test("a ping-capable pooled socket honours the configured idle value past the ceiling", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness(t, { sessionId: "session", idleTimeoutMs: 500_000, keepAlive: true });
+	const response = await h.request();
+	complete(h.sockets[0]);
+	t.mock.timers.tick(200_000);
+	assert.equal(h.sockets[0].closed, 0, "still pooled at 200 s because the socket keeps itself alive");
+	t.mock.timers.tick(300_001);
+	assert.equal(h.sockets[0].closed, 1);
+	await response.text();
+});
+
+test("auto replays a zero-frame drop once on a fresh connection without HTTP fallback", async (t) => {
+	const h = harness(t, { transport: "auto", sessionId: "session" });
+	const response = await h.request();
+	h.sockets[0].remoteClose();
+	await until(() => h.sockets.length === 2 && h.sockets[1].sent.length === 1);
+	complete(h.sockets[1], "resp_replayed");
+	assert.match(await response.text(), /resp_replayed/);
+	assert.equal(h.fallbacks.length, 0);
+	assert.deepEqual(h.notices, [], "a successful replay needs no fallback notice");
+});
+
+test("strict modes replay once, then surface replay facts without HTTP", async (t) => {
+	const h = harness(t, { transport: "websocket", sessionId: "session" });
+	const response = await h.request();
+	h.sockets[0].remoteClose();
+	await until(() => h.sockets.length === 2 && h.sockets[1].sent.length === 1);
+	h.sockets[1].remoteCloseAt(1009, "message too big");
+	let message = "";
+	await assert.rejects(response.text(), (error: Error) => { message = error.message; return true; });
+	assert.match(message, /WebSocket closed before terminal response \(code 1009, reason "message too big", clean/);
+	assert.match(message, /after 1 replay with no output/);
+	assert.equal(h.fallbacks.length, 0, "strict modes never fall back over HTTP");
+});
+
+test("auto drains the HTTP SSE stream when the replay also produced no frames", async (t) => {
+	const h = harness(t, { transport: "auto", sessionId: "session" });
+	const response = await h.request();
+	h.sockets[0].remoteClose();
+	await until(() => h.sockets.length === 2 && h.sockets[1].sent.length === 1);
+	h.sockets[1].remoteClose();
+	assert.equal(await response.text(), "HTTP fallback");
+	assert.equal(h.fallbacks.length, 1);
+	assert.equal(h.notices.length, 1);
+	assert.match(h.notices[0], /after 1 replay with no output/);
+	assert.match(h.notices[0], /using HTTP SSE/);
+});
+
+test("replay never happens after output frames arrive", async (t) => {
+	const h = harness(t, { transport: "auto", sessionId: "session" });
+	const response = await h.request();
+	h.sockets[0].message({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, content_index: 0, delta: "hi" });
+	h.sockets[0].remoteClose();
+	let message = "";
+	await assert.rejects(response.text(), (error: Error) => { message = error.message; return true; });
+	assert.match(message, /frames 1/);
+	assert.equal(h.sockets.length, 1, "no second connection once output started");
+	assert.equal(h.fallbacks.length, 0);
+});
 
 test("binary JSON frames decode and incomplete terminal is preserved", async (t) => {
 	const h = harness(t);
@@ -669,7 +834,7 @@ test("Node 24 native WS actually forwards dummy handshake headers and sends resp
 		});
 	});
 	let fallbackCalls = 0;
-	const transport = new ResponsesWebSocketTransport();
+	const transport = new ResponsesWebSocketTransport(nativeFactory);
 	t.after(() => transport.close());
 	const fetch = transport.createFetch({ transport: "websocket", connectTimeoutMs: 1000, idleTimeoutMs: 1000,
 		fallbackFetch: async () => { fallbackCalls++; throw new Error("unexpected HTTP fallback"); } });
@@ -696,7 +861,7 @@ test("native WS handshake does not follow redirects or leak headers to redirect 
 	source.server.on("upgrade", (_request, socket) => {
 		socket.end(`HTTP/1.1 302 Found\r\nLocation: ${target.base}/v1/responses\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
 	});
-	const transport = new ResponsesWebSocketTransport();
+	const transport = new ResponsesWebSocketTransport(nativeFactory);
 	t.after(() => transport.close());
 	const fetch = transport.createFetch({ transport: "websocket", connectTimeoutMs: 1000,
 		fallbackFetch: async () => { throw new Error("unexpected HTTP fallback"); } });

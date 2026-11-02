@@ -36,11 +36,11 @@ Open `/providers` → provider → **传输方式 / 超时**; save and `/reload`
 
 | Mode | Standard `openai-responses` behavior |
 |---|---|
-| Inherit | No transport override; Pi 0.85.1 still uses SSE for standard Responses |
-| `auto` | Try WS; fall back to SSE with a notice only if the handshake fails before sending the generation request |
+| Inherit | No transport override; Pi still uses SSE for standard Responses |
+| `auto` | Try WS; fall back to SSE with a notice if the handshake fails, or if a sent request produced no frame at all on that connection |
 | `sse` | Original HTTP/SSE path |
-| `websocket` | Strict WS with full context; never fall back to SSE |
-| `websocket-cached` | Strict WS with safe connection-scoped context continuation |
+| `websocket` | Strict WS with full context; replays once on a fresh connection while no frame arrived, never falls back to SSE |
+| `websocket-cached` | Strict WS with safe connection-scoped context continuation; replays once while no frame arrived, never falls back to SSE |
 
 Settings are stored in `~/.pi/agent/provider-transports.json`, respecting `PI_CODING_AGENT_DIR`. The plugin does not add ignored transport keys to `models.json` or duplicate credentials.
 
@@ -56,16 +56,16 @@ Settings are stored in `~/.pi/agent/provider-transports.json`, respecting `PI_CO
 }
 ```
 
-Timeouts are integer milliseconds; clearing inherits Pi. `httpIdleTimeoutMs` also overrides the SDK `timeoutMs` for SSE. Standard Responses WS uses bridge-owned handshake, fallback and stream timers so a shorter SDK deadline cannot race them. `0` disables plugin timers using the SDK-compatible disabled value; caller AbortSignals and custom-fetch deadlines still apply. Cancellation, post-send disconnects and stream-idle timeouts never trigger SSE replay. Keep CPA on `openai-responses` and its original HTTPS base URL.
+Timeouts are integer milliseconds; clearing inherits Pi. `httpIdleTimeoutMs` also overrides the SDK `timeoutMs` for SSE. Standard Responses WS uses bridge-owned handshake, fallback and stream timers so a shorter SDK deadline cannot race them; in that mode the value is the stream-idle gap and the pooled-socket expiry, and it does not bound the SDK request timeout (the bridge sets that to unlimited). `0` disables plugin timers using the SDK-compatible disabled value; caller AbortSignals and custom-fetch deadlines still apply. A request that was sent but produced no frame at all is replayed once on a fresh connection; if that also stays silent, `auto` switches to SSE while strict WS reports the failure. Disconnects after the first frame, cancellation and stream-idle timeouts are never replayed or downgraded. A silent socket is killed by the link after about 129 s, so the `ws` transport keeps pooled sockets alive with pings and a transport without ping support pools for at most 110 s. Keep CPA on `openai-responses` and its original HTTPS base URL.
 For 60 seconds enter `60000`, not `60`; auto fallback notices include the connection failure reason and timeout in milliseconds. Like Pi's parser, non-generation metadata such as `codex.rate_limits` and `codex.response.metadata` is ignored rather than treated as model output or protocol errors.
-Fallback warnings appear once per Pi session across providers, surviving reload/resume and branch navigation; new or forked sessions may warn again. The marker stays out of model context and does not change fallback behavior for later requests.
+One session entry is recorded for the first fallback and the first replay, carrying the provider, transport mode and the connection facts (close code, frames, socket age). The UI warning still appears once per Pi session across providers, surviving reload/resume and branch navigation; new or forked sessions may warn again. These entries stay out of model context and do not change fallback behavior for later requests.
 
 Transport overrides only apply to a single `openai-responses` or `openai-codex-responses` API without conflicting extension registration. Anthropic, Gemini, Chat Completions, Azure and other APIs retain native streaming/thinking semantics; old overrides are reported but not applied and can be cleared in the menu. Native Codex keeps Pi's WS and auto behavior; strict WS blocks HTTP downgrade. Reload after API/catalog changes.
 
 WS events become an internal SSE stream for Pi's text, thinking, tool-call and usage parser; response callbacks see a synthetic status, not WS handshake headers. Select `sse` to restore HTTP transport. Clear all provider transport and timeout overrides, then `/reload`, to fully restore Pi's native path.
 Cached continuation requires an exact input/output prefix match; mismatches send full context over WS. Per-request tracing headers do not prevent reuse, so handshake trace headers retain their first-request values. Invalid provider entries are isolated and cannot disable another provider's strict WS setting.
 
-Verified target: Pi 0.85.1 / Node 24. Development checks: `npm run check`, `npm test` (dummy credentials and local WS; no real model calls).
+Verified target: Pi 1.4.0 / Node 26; the `ws` transport depends on the `ws` package. Development checks: `npm run check`, `npm test` (dummy credentials and local WS; no real model calls).
 
 ## Install
 

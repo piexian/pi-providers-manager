@@ -7,10 +7,10 @@ export interface TransportUI {
 	notify(message: string, type: "info" | "warning" | "error"): void;
 }
 const DESCRIPTIONS: Record<Transport, string> = {
-	auto: "Responses 优先 WS；仅握手失败且未发送请求时回退 SSE，并提示原因",
+	auto: "Responses 优先 WS；握手失败或发送后整条连接无输出时回退 SSE，并提示原因",
 	sse: "使用原有 HTTP/SSE 链路，不尝试 WS",
-	websocket: "严格 WS，全量上下文；连接失败报错，不回退 SSE",
-	"websocket-cached": "严格 WS，安全匹配时复用连接上的上下文；失败不回退 SSE",
+	websocket: "严格 WS，全量上下文；无输出帧时重放一次，不回退 SSE",
+	"websocket-cached": "严格 WS，安全匹配时复用连接上的上下文；无输出帧时重放一次，不回退 SSE",
 };
 
 export async function editProviderTransport(ui: TransportUI, store: TransportConfigStore, providerId: string, apis: string[]): Promise<void> {
@@ -21,7 +21,7 @@ export async function editProviderTransport(ui: TransportUI, store: TransportCon
 		const action = await ui.pick(`${providerId} 传输设置（保存后 /reload 生效）`, [
 			{ value: "transport", label: `transport: ${settings.transport ?? "(继承 Pi，不接管传输)"}`, description: unsupported.length ? `保留原生传输，仅可清空旧覆盖: ${unsupported.join(", ")}` : "适用于该供应商的全部模型；不改变 API 类型和凭据" },
 			{ value: "websocketConnectTimeoutMs", label: `WS 握手超时: ${settings.websocketConnectTimeoutMs ?? "(继承 Pi，默认 15000)"} ms`, description: "0 禁用；留空清除供应商覆盖" },
-			{ value: "httpIdleTimeoutMs", label: `请求/流空闲超时: ${settings.httpIdleTimeoutMs ?? "(继承 Pi，默认 300000)"} ms`, description: "同时覆盖 SDK 请求超时与流空闲间隔；0 禁用，调用方 AbortSignal 仍有效" },
+			{ value: "httpIdleTimeoutMs", label: `请求/流空闲超时: ${settings.httpIdleTimeoutMs ?? "(继承 Pi，默认 300000)"} ms`, description: "WS 下为流空闲计时与连接池回收上限（静默连接另受链路约 129 秒限制），不覆盖 SDK 请求超时；SSE 下即 SDK 请求超时；0 禁用流计时" },
 		]);
 		if (action === null) return;
 		if (action === "transport") {

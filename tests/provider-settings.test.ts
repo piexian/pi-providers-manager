@@ -105,4 +105,37 @@ test("real provider menus reject fractional caps, resolve native lists and disam
 		const notices = await run(["cpa", "接口拉取", null, null], []);
 		assert.equal(requests.length, count); assert.ok(notices.some((text) => text.includes("未设置的环境变量")));
 	});
+	await t.test("provider api switch derives the endpoint from one canonical base", async () => {
+		const data = initial(); data.providers.cpa.baseUrl = "https://host.invalid/v1"; writeFileSync(path, JSON.stringify(data));
+		await run(["cpa", "API 类型", "anthropic-messages", null, null], []);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).providers.cpa.baseUrl, "https://host.invalid");
+		const notices = await run(["cpa", "API 类型", "openai-responses", null, null], []);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).providers.cpa.baseUrl, "https://host.invalid/v1");
+		assert.ok(notices.some((text) => text.includes("端点 https://host.invalid/v1")));
+	});
+	await t.test("model api switch rewrites the endpoint without any manual input", async () => {
+		const data = initial(); data.providers.cpa.baseUrl = "https://host.invalid/v1"; writeFileSync(path, JSON.stringify(data));
+		await run(["cpa", "edit", "dummy-model", "api", "anthropic-messages", null, null, null, null], []);
+		let model = JSON.parse(readFileSync(path, "utf8")).providers.cpa.models[0];
+		assert.equal(model.api, "anthropic-messages");
+		assert.equal(model.baseUrl, "https://host.invalid", "the model gets the anthropic-shaped endpoint automatically");
+		await run(["cpa", "edit", "dummy-model", "api", "openai-responses", null, null, null, null], []);
+		model = JSON.parse(readFileSync(path, "utf8")).providers.cpa.models[0];
+		assert.equal(model.baseUrl, undefined, "an endpoint identical to the inherited one needs no override");
+	});
+	await t.test("advanced overrides keep a verbatim endpoint and warn when the shape differs", async () => {
+		writeFileSync(path, JSON.stringify(initial("anthropic-messages")));
+		const notices = await run(["cpa", "endpoint", null, null], ["https://api.deepseek.com/v1"]);
+		const provider = JSON.parse(readFileSync(path, "utf8")).providers.cpa;
+		assert.equal(provider.baseUrl, "https://api.deepseek.com/v1", "the advanced entry never rewrites the value");
+		assert.ok(notices.some((text) => text.includes("常见形态不同")));
+	});
+	await t.test("model endpoint override derives from the model api", async () => {
+		const data = initial(); data.providers.cpa.baseUrl = "https://host.invalid/v1"; writeFileSync(path, JSON.stringify(data));
+		await run(["cpa", "modelEndpoint", "dummy-model", null, null, null], ["https://host.invalid"]);
+		const model = JSON.parse(readFileSync(path, "utf8")).providers.cpa.models[0];
+		assert.equal(model.baseUrl, "https://host.invalid/v1");
+		await run(["cpa", "modelEndpoint", "dummy-model", null, null, null], [""]);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).providers.cpa.models[0].baseUrl, undefined);
+	});
 });

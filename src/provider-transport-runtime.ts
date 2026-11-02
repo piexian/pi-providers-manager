@@ -33,7 +33,7 @@ export function delegateStream(base: Provider, model: Parameters<Provider["strea
 	return fullKeys.some((key) => Object.hasOwn(rawOptions, key)) ? base.stream(model, context, options) : base.streamSimple(model, context, options);
 }
 
-export function applyTransportOptions(modelApi: string, settings: ProviderTransportSettings, defaults: ProviderTransportSettings, options: StreamOptions, bridge: ResponsesWebSocketTransport, onFallback: (reason: string) => void): StreamOptions {
+export function applyTransportOptions(modelApi: string, settings: ProviderTransportSettings, defaults: ProviderTransportSettings, options: StreamOptions, bridge: ResponsesWebSocketTransport, onFallback: (reason: string) => void, onReplay?: (reason: string) => void): StreamOptions {
 	const transport = settings.transport;
 	const strict = transport === "websocket" || transport === "websocket-cached";
 	if (!isResponsesApi(modelApi)) throw new Error(`${modelApi} 没有安全的 WS/传输适配；必须保留原生入口`);
@@ -55,7 +55,10 @@ export function applyTransportOptions(modelApi: string, settings: ProviderTransp
 			connectTimeoutMs: connectMs,
 			idleTimeoutMs: idleMs,
 			fallbackFetch,
+			// Pi's own retry budget gates the transport replay: disabling retries must not hide a resend.
+			maxReplay: options.maxRetries === undefined ? 1 : Math.min(1, Math.max(0, Math.trunc(options.maxRetries))),
 			onFallback,
+			onReplay,
 		});
 	} else if (modelApi === "openai-codex-responses" && strict) {
 		// Native Codex may attempt SSE even in websocket mode; block that network path.
@@ -85,9 +88,14 @@ export function registerProviderTransports(pi: ExtensionAPI, store: TransportCon
 		}
 		const sessionId = ctx.sessionManager.getSessionId();
 		// Persist across reload/resume and branches, but not into a new or forked session.
-		let fallbackWarned = ctx.sessionManager.getEntries().some((entry) => entry.type === "custom"
+		const priorEntries = ctx.sessionManager.getEntries().filter((entry) => entry.type === "custom"
 			&& entry.customType === FALLBACK_WARNING_ENTRY && entry.data !== null && typeof entry.data === "object"
 			&& (entry.data as { sessionId?: unknown }).sessionId === sessionId);
+		// One entry and one notice per kind per session; replays stay silent in the UI.
+		const recordedKinds = new Set<string>(priorEntries.map((entry) => {
+			const data = (entry as { data?: unknown }).data as { kind?: unknown } | undefined;
+			return typeof data?.kind === "string" ? data.kind : "fallback";
+		}));
 		for (const [id, rawSettings] of Object.entries(settingsByProvider)) {
 			let settings: ProviderTransportSettings = {};
 			let configError = false;
@@ -110,15 +118,21 @@ export function registerProviderTransports(pi: ExtensionAPI, store: TransportCon
 				ctx.ui.notify(`${id}: ${api} 保留原生传输与思考参数，本插件不应用传输/超时覆盖`, "warning");
 				continue;
 			}
+			const record = (kind: "fallback" | "replay", reason: string): boolean => {
+				if (recordedKinds.has(kind)) return false;
+				recordedKinds.add(kind);
+				pi.appendEntry(FALLBACK_WARNING_ENTRY,
+					{ sessionId, provider: id, kind, transport: settings.transport ?? "inherit", reason });
+				return true;
+			};
 			if (configError) ctx.ui.notify(`${id}: 传输设置无效，已阻止该供应商请求；请修正配置后 /reload`, "error");
 			const wrapper: Provider["streamSimple"] = (model, context, options = {}) => {
 				if (configError) throw new Error(`${id}: 传输设置无效，禁止回退原始传输；请修正 ${store.path} 后 /reload`);
-				return delegateStream(base, model, context, applyTransportOptions(model.api, settings, defaults, options, bridge, (reason) => {
-					if (fallbackWarned) return;
-					fallbackWarned = true;
-					ctx.ui.notify(`${id}: WS 尚未发送请求，本次回退 SSE；原因：${reason}`, "warning");
-					pi.appendEntry(FALLBACK_WARNING_ENTRY, { sessionId, provider: id });
-				}));
+				return delegateStream(base, model, context, applyTransportOptions(model.api, settings, defaults, options, bridge,
+					(reason) => {
+						if (record("fallback", reason)) ctx.ui.notify(`${id}: WS 已回退 SSE；原因：${reason}`, "warning");
+					},
+					(reason) => record("replay", reason)));
 			};
 			pi.registerProvider(id, { api, streamSimple: wrapper });
 			owned.set(id, wrapper);

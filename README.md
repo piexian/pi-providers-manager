@@ -38,11 +38,11 @@ pi 编码代理的交互式供应商/模型/子代理管理扩展。
 
 | 模式 | 标准 `openai-responses` 行为 |
 |---|---|
-| 继承 | 不接管传输；Pi 0.85.1 的普通 Responses 仍走 SSE |
-| `auto` | WS 优先；仅握手失败、尚未发送生成请求时回退 SSE，并提示 |
+| 继承 | 不接管传输；Pi 的普通 Responses 仍走 SSE |
+| `auto` | WS 优先；握手失败，或请求已发出而整条连接无任何输出帧时回退 SSE，并提示 |
 | `sse` | 原有 HTTP/SSE |
-| `websocket` | 严格 WS、全量上下文；不回退 SSE |
-| `websocket-cached` | 严格 WS；安全匹配时使用连接内上下文续传 |
+| `websocket` | 严格 WS、全量上下文；无输出帧时在新连接重放一次，不回退 SSE |
+| `websocket-cached` | 严格 WS；安全匹配时使用连接内上下文续传；无输出帧时重放一次，不回退 SSE |
 
 配置存于 `~/.pi/agent/provider-transports.json`（支持 `PI_CODING_AGENT_DIR`）；不向 `models.json` 写入无效的 transport 字段，不复制密钥。
 
@@ -58,16 +58,16 @@ pi 编码代理的交互式供应商/模型/子代理管理扩展。
 }
 ```
 
-超时单位为毫秒，清空则继承 Pi。`httpIdleTimeoutMs` 控制请求/流空闲时间：SSE 同步覆盖 SDK 的 `timeoutMs`；标准 Responses WS 由桥接层管理握手、回退和流计时，避免 SDK 的短截止抢先取消。`0` 关闭本插件计时，SDK 使用其禁用约定值；调用方 `AbortSignal` 或自定义 fetch 的截止仍有效。取消、发送后的断线及流超时不自动转 SSE；CPA 保持 `openai-responses` 和原 HTTPS baseUrl。
+超时单位为毫秒，清空则继承 Pi。`httpIdleTimeoutMs` 控制请求/流空闲时间：SSE 同步覆盖 SDK 的 `timeoutMs`；标准 Responses WS 由桥接层管理握手、回退和流计时，避免 SDK 的短截止抢先取消，此模式下它同时是流空闲间隔与连接池回收时间，不覆盖 SDK 请求超时（WS 请求超时由桥接层置为不限）。`0` 关闭本插件计时，SDK 使用其禁用约定值；调用方 `AbortSignal` 或自定义 fetch 的截止仍有效。请求发出后若整条连接没有产生任何输出帧，会在一条新连接上重放一次；仍无输出时 `auto` 转 SSE、严格 WS 报错。已有输出帧之后的断线、取消与流超时既不重放也不转 SSE。静默连接受链路约 129 秒上限约束，因此 `ws` 传输用 ping 保活，无保活能力的原生 WebSocket 池内最长保留 110 秒。CPA 保持 `openai-responses` 和原 HTTPS baseUrl。
 例如 60 秒应填 `60000`，不是 `60`；auto 回退警告会显示连接失败原因和超时毫秒值。与 Pi 原解析器一致，忽略 `codex.rate_limits`、`codex.response.metadata` 等非生成元数据，不视为模型输出或协议错误。
-回退警告每个 Pi 会话只显示一次（跨供应商），`/reload`、续聊和切分支不重置；新建或 fork 会话可重新提示。去重标记不进入模型上下文，不影响后续请求的回退。
+回退与重放各记录一条会话条目（含供应商、传输方式和带关闭码的连接事实），UI 警告仍每个 Pi 会话只显示一次（跨供应商），`/reload`、续聊和切分支不重置；新建或 fork 会话可重新提示。这些条目不进入模型上下文，不影响后续请求的回退。
 
 传输覆盖仅接管单一 `openai-responses` / `openai-codex-responses` API，且不得与其他扩展注册冲突。Anthropic、Gemini、Chat Completions、Azure 等保留原生传输与思考参数，旧覆盖仅提示、不生效，可在菜单清空。原生 Codex 保留 Pi 的 WS 实现和 auto 策略，严格 WS 阻止 HTTP 降级；更改 API 或模型列表后需 `/reload`。
 
 WS 网络事件在插件内部转成 SSE 流，继续由 Pi 解析文本、思考、工具调用和用量；响应回调看到的是合成状态，不是原始握手响应头。选择 `sse` 恢复 HTTP 传输；清除该供应商所有传输及超时覆盖后 `/reload`，才完全恢复 Pi 原生链路。
 缓存续传仅在输入前缀与上一响应精确匹配时启用，否则仍用 WS 发送完整上下文。逐请求追踪头不影响连接复用；复用期间的握手追踪头保持首个请求值。各供应商独立校验，坏条目不会禁用其他供应商的严格 WS。
 
-验证环境：Pi 0.85.1 / Node 24。开发检查：`npm run check`、`npm test`（假凭据与本地 WS，不调用真实模型）。
+验证环境：Pi 1.4.0 / Node 26（`ws` 传输依赖 `ws` 包）。开发检查：`npm run check`、`npm test`（假凭据与本地 WS，不调用真实模型）。
 
 ## 安装
 
